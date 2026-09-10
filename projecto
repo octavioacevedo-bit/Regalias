@@ -1,1 +1,366 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import date, datetime
+
+st.set_page_config(page_title="Proyección IGPR", layout="wide")
+st.title("Proyección IGPR — proyectos")
+st.caption("Motor de escenarios basado en la Resolución 4574 de 2025 y en las columnas de la base suministrada.")
+
+# -----------------------------
+# Reglas del modelo
+# -----------------------------
+CORTES = {
+    "I trimestre": "03-31",
+    "II trimestre": "06-30",
+    "III trimestre": "09-30",
+    "IV trimestre": "12-31",
+}
+
+def num(x, default=np.nan):
+    if pd.isna(x):
+        return default
+    try:
+        return float(str(x).replace(",", "").replace("%", "").strip())
+    except Exception:
+        return default
+
+def dateval(x):
+    if pd.isna(x) or x == "":
+        return pd.NaT
+    return pd.to_datetime(x, errors="coerce")
+
+def safe_avg(values):
+    v = [x for x in values if pd.notna(x)]
+    return float(np.mean(v)) if v else np.nan
+
+def contracting_score(days, scenario):
+    """Reglas documentadas para Sin contratar."""
+    if pd.isna(days):
+        return np.nan
+    d = float(days)
+    if scenario == 1:
+        if d <= 45:
+            return 100.0
+        if d > 60:
+            return 0.0
+        # 46-60: interpolación lineal 100 -> 0
+        return max(0.0, min(100.0, (60-d)/(60-45)*100))
+    if scenario == 2:
+        # El PDF indica 100 <= 6 meses y 0 >= 6 meses.
+        # Se modela como lineal en días entre 0 y 6 meses (180 días)
+        return max(0.0, min(100.0, (180-d)/180*100))
+    if scenario == 3:
+        # El PDF contiene una inconsistencia tipográfica en una viñeta
+        # (120 días y una referencia posterior a 60). Se usa el umbral
+        # principal explícito: <=120 = 100; >180 = 0; 120-180 lineal.
+        if d <= 120:
+            return 100.0
+        if d > 180:
+            return 0.0
+        return max(0.0, min(100.0, (180-d)/(180-120)*100))
+    return np.nan
+
+def breach_score(fin, fis):
+    """Indicador brecha: 100 si está dentro de la tolerancia, 0 si la supera."""
+    fin = num(fin); fis = num(fis)
+    if pd.isna(fin) or pd.isna(fis):
+        return np.nan
+    # La metodología usa avance financiero y brecha en puntos porcentuales.
+    gap = abs(fin-fis)
+    if fin < 60:
+        allowed = 50
+    elif fin < 70:
+        allowed = 40
+    elif fin < 80:
+        allowed = 30
+    elif fin < 90:
+        allowed = 20
+    else:
+        allowed = 10
+    return 100.0 if gap <= allowed else 0.0
+
+def project_score_execution(row, cutoff, phys=None, fin=None, spi=None, cpi=None,
+                            programming_status=None, reprogram_factor=None):
+    """
+    Escenario 1 de En ejecución: 40% cronograma + 20% costo + 40% brecha.
+    Escenario 2 (sin avance físico/financiero): 100% cronograma.
+    El descuento de programación vencida se aplica al resultado final,
+    de acuerdo con la metodología.
+    """
+    phys = num(row.get("AVANCE_FÍSICO"), np.nan) if phys is None else float(phys)
+    fin = num(row.get("AVANCE_FINANCIERO"), np.nan) if fin is None else float(fin)
+    spi = num(row.get("SPI"), np.nan) if spi is None else float(spi)
+    cpi = num(row.get("CPI"), np.nan) if cpi is None else float(cpi)
+
+    # En la base, el indicador de cronograma ya viene calculado como 40/100.
+    # Para simulación, si el usuario entrega SPI, se transforma de forma
+    # configurable y conservadora: SPI>=1 -> 100; SPI<1 -> SPI*100.
+    if pd.notna(spi):
+        cron = 100.0 if spi >= 1 else max(0, min(100, spi*100))
+    else:
+        cron = num(row.get("CALIFICACIÓN_CRONOGRAMA"), np.nan)
+
+    if pd.notna(cpi):
+        costo = 100.0 if cpi >= 1 else 0.0
+    else:
+        costo = num(row.get("CALIFICACIÓN_COSTO"), np.nan)
+
+    brecha = breach_score(fin, phys)
+
+    moved = (phys > num(row.get("AVANCE_FÍSICO_BASE"), phys) if pd.notna(num(row.get("AVANCE_FÍSICO_BASE"), np.nan)) else False)
+    # Para la proyección manual se considera avance si alguno de los dos
+    # porcentajes es mayor que cero.
+    has_progress = (pd.notna(phys) and phys > 0) or (pd.notna(fin) and fin > 0)
+
+    if not has_progress:
+        raw = cron if pd.notna(cron) else np.nan
+    else:
+        parts = []
+        if pd.notna(cron): parts.append(0.40*cron)
+        if pd.notna(costo): parts.append(0.20*costo)
+        if pd.notna(brecha): parts.append(0.40*brecha)
+        raw = sum(parts) if parts else np.nan
+
+    factor = 1.0
+    if programming_status == "Programación vencida":
+        factor *= 0.50
+    elif programming_status == "Sin programación":
+        raw = 0.0
+
+    if reprogram_factor is not None and pd.notna(reprogram_factor):
+        factor *= float(reprogram_factor)
+
+    return raw * factor if pd.notna(raw) else np.nan
+
+def final_factor(row):
+    # Reprogramaciones: la base suministrada trae directamente el % afectación.
+    f = num(row.get("% AFECTACIÓN REPROGRAMACIÓN"), 1.0)
+    if pd.isna(f):
+        f = 1.0
+    return f
+
+# -----------------------------
+# Carga
+# -----------------------------
+up = st.file_uploader("Carga la base Excel (BASE GENERAL...xlsx)", type=["xlsx"])
+if not up:
+    st.info("Carga la base para iniciar. El modelo también permite agregar proyectos manualmente.")
+    st.stop()
+
+xls = pd.ExcelFile(up)
+sheet = st.selectbox("Hoja de proyectos", xls.sheet_names, index=0)
+raw = pd.read_excel(up, sheet_name=sheet, header=None)
+
+# La base suministrada tiene títulos en la fila 3 (índice 2).
+if len(raw) > 2 and "BPIN" in raw.iloc[2].astype(str).tolist():
+    df = raw.iloc[3:].copy()
+    df.columns = raw.iloc[2].tolist()
+else:
+    df = pd.read_excel(up, sheet_name=sheet)
+
+df = df.loc[:, ~pd.Index(df.columns).duplicated()]
+df = df.dropna(how="all").copy()
+
+# Normalización de nombres usados por el motor
+rename = {}
+for c in df.columns:
+    s = str(c).upper()
+    if s == "BPIN": rename[c] = "BPIN"
+    elif "NOMBRE DEL PROYECTO" in s: rename[c] = "NOMBRE"
+    elif "ESTADO GENERAL" in s: rename[c] = "ESTADO"
+    elif s.startswith("FECHA INICIAL DE LA PROGRAMACIÓN"): rename[c] = "FECHA_INI_PROG"
+    elif s.startswith("FECHA FINAL DE LA PROGRAMACIÓN"): rename[c] = "FECHA_FIN_PROG"
+    elif "AVANCE FÍSICO" in s: rename[c] = "AVANCE_FÍSICO"
+    elif "AVANCE FINANCIERO" in s: rename[c] = "AVANCE_FINANCIERO"
+    elif "DESEMPEÑO DEL CRONOGRAMA" in s and "CALIFICACIÓN" in s: rename[c] = "CALIFICACIÓN_CRONOGRAMA"
+    elif "DESEMPEÑO DEL COSTO" in s and "CALIFICACIÓN" in s: rename[c] = "CALIFICACIÓN_COSTO"
+    elif s.strip() == "CPI": rename[c] = "CPI"
+    elif "SPI(T)" in s: rename[c] = "SPI"
+    elif "IGPR PROYECTO" in s and "FINAL" in s: rename[c] = "IGPR_ACTUAL"
+    elif "% AFECTACION REPROGRAMACIÓN" in s or "% AFECTACION REPROGRAMACIÓN" == s.strip(): rename[c] = "% AFECTACIÓN REPROGRAMACIÓN"
+df = df.rename(columns=rename)
+
+# Cualquier columna duplicada queda fuera
+for needed in ["BPIN","NOMBRE","ESTADO","AVANCE_FÍSICO","AVANCE_FINANCIERO","IGPR_ACTUAL"]:
+    if needed not in df.columns:
+        df[needed] = np.nan
+
+# -----------------------------
+# Parámetros
+# -----------------------------
+st.sidebar.header("Periodo de proyección")
+year = st.sidebar.number_input("Año", min_value=2025, max_value=2035, value=2026)
+quarter = st.sidebar.selectbox("Corte", list(CORTES.keys()), index=2)
+cutoff = pd.Timestamp(f"{int(year)}-{CORTES[quarter]}")
+
+st.sidebar.header("Reglas de escenario")
+st.sidebar.write("Sin contratar: 50% contratación + 50% programación.")
+st.sidebar.write("En ejecución con avance: 40% cronograma + 20% costo + 40% brecha.")
+st.sidebar.write("En ejecución sin avance: 100% cronograma.")
+st.sidebar.write("Programación vencida: factor 0,50.")
+st.sidebar.write("Terminado: promedio simple del cumplimiento de indicadores de producto.")
+
+# -----------------------------
+# Editor de escenarios
+# -----------------------------
+work = df[["BPIN","NOMBRE","ESTADO","AVANCE_FÍSICO","AVANCE_FINANCIERO","IGPR_ACTUAL"]].copy()
+work["No medir"] = False
+work["Nuevo estado"] = work["ESTADO"]
+work["Físico proyectado (%)"] = pd.to_numeric(work["AVANCE_FÍSICO"], errors="coerce")
+work["Financiero proyectado (%)"] = pd.to_numeric(work["AVANCE_FINANCIERO"], errors="coerce")
+work["SPI proyectado"] = np.nan
+work["CPI proyectado"] = np.nan
+work["Programación"] = "Según base"
+work["IGPR manual"] = np.nan
+work["Observación"] = ""
+
+st.subheader("1. Proyectos actuales")
+edited = st.data_editor(
+    work,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "No medir": st.column_config.CheckboxColumn(),
+        "Nuevo estado": st.column_config.SelectboxColumn(options=["SIN CONTRATAR","EN EJECUCIÓN","TERMINADO"]),
+        "Físico proyectado (%)": st.column_config.NumberColumn(min_value=0,max_value=120,step=0.1),
+        "Financiero proyectado (%)": st.column_config.NumberColumn(min_value=0,max_value=120,step=0.1),
+        "SPI proyectado": st.column_config.NumberColumn(min_value=0,max_value=2,step=0.01),
+        "CPI proyectado": st.column_config.NumberColumn(min_value=0,max_value=2,step=0.01),
+        "Programación": st.column_config.SelectboxColumn(options=["Según base","Vigente","Programación vencida","Sin programación"]),
+        "IGPR manual": st.column_config.NumberColumn(min_value=0,max_value=100,step=0.1),
+    },
+    disabled=["BPIN","NOMBRE","ESTADO","AVANCE_FÍSICO","AVANCE_FINANCIERO","IGPR_ACTUAL"],
+    key="editor"
+)
+
+# -----------------------------
+# Cálculo de proyección
+# -----------------------------
+def calc_row(r):
+    if bool(r["No medir"]):
+        return np.nan, "NO MEDIR"
+    manual = num(r["IGPR manual"])
+    if pd.notna(manual):
+        return max(0,min(100,manual)), "MANUAL"
+
+    state = str(r["Nuevo estado"]).upper()
+    phys = num(r["Físico proyectado (%)"])
+    fin = num(r["Financiero proyectado (%)"])
+    spi = num(r["SPI proyectado"])
+    cpi = num(r["CPI proyectado"])
+    prog = r["Programación"]
+
+    if state == "EN EJECUCIÓN":
+        # Si no se entrega SPI/CPI, usa las calificaciones actuales cuando existan.
+        rr = r.copy()
+        score = project_score_execution(
+            rr, cutoff, phys=phys, fin=fin, spi=spi, cpi=cpi,
+            programming_status=prog
+        )
+        if pd.isna(score):
+            # respaldo: si existe IGPR actual, mantenerlo como baseline
+            score = num(r["IGPR_ACTUAL"])
+        return score, "MODELO EN EJECUCIÓN"
+
+    if state == "TERMINADO":
+        # El dato más fiable para terminado debe venir de los indicadores de producto.
+        # Si no están disponibles, no se inventa: se conserva baseline.
+        base = num(r["IGPR_ACTUAL"])
+        return base, "BASE — ingresar % indicadores producto para mayor precisión"
+
+    if state == "SIN CONTRATAR":
+        # La metodología actual exige 2 indicadores de 50%.
+        # La eficiencia de programación no está suficientemente estructurada
+        # en la base suministrada; por seguridad se deja parametrizable.
+        return num(r["IGPR_ACTUAL"]), "BASE — falta parametrizar programación"
+
+    return num(r["IGPR_ACTUAL"]), "BASE"
+
+scores = []
+notes = []
+for _, r in edited.iterrows():
+    s,n = calc_row(r)
+    scores.append(s); notes.append(n)
+
+edited["IGPR PROYECTADO"] = scores
+edited["Tipo cálculo"] = notes
+
+# -----------------------------
+# Proyectos nuevos
+# -----------------------------
+st.subheader("2. Agregar proyectos que podrían entrar al promedio")
+nnew = st.number_input("Cantidad de proyectos nuevos", min_value=0, max_value=100, value=0, step=1)
+
+new_rows=[]
+for i in range(int(nnew)):
+    c1,c2,c3,c4 = st.columns([1.4,3,1.5,1.5])
+    bpin=c1.text_input(f"BPIN {i+1}", key=f"nb{i}")
+    name=c2.text_input(f"Nombre {i+1}", key=f"nn{i}")
+    score=c3.number_input(f"IGPR {i+1}",0.0,100.0,70.0,0.1,key=f"ns{i}")
+    include=c4.checkbox("Incluir",value=True,key=f"ni{i}")
+    if include:
+        new_rows.append({"BPIN":bpin or f"NUEVO-{i+1}","NOMBRE":name or "Proyecto nuevo","IGPR PROYECTADO":score,"No medir":False,"Tipo cálculo":"MANUAL / NUEVO"})
+
+if new_rows:
+    edited = pd.concat([edited, pd.DataFrame(new_rows)], ignore_index=True)
+
+# -----------------------------
+# Ajuste de reprogramaciones / descuentos
+# -----------------------------
+st.subheader("3. Ajustes de factores")
+st.caption("La columna de reprogramación de la base puede incorporarse cuando se conozca el número de modificaciones y su techo.")
+
+# -----------------------------
+# Resultado entidad
+# -----------------------------
+included = edited[(~edited["No medir"]) & pd.notna(edited["IGPR PROYECTADO"])]
+avg = included["IGPR PROYECTADO"].mean() if len(included) else np.nan
+
+c1,c2,c3 = st.columns(3)
+c1.metric("Proyectos incluidos", len(included))
+c2.metric("IGPR promedio proyectado", "—" if pd.isna(avg) else f"{avg:.1f}")
+c3.metric("Meta > 70", "CUMPLE" if pd.notna(avg) and avg>70 else "NO CUMPLE")
+
+# Mínimo necesario si se quiere llegar a 70, suponiendo que los proyectos nuevos
+# tienen IGPR de 100. También permite saber cuántos proyectos de 100 hacen falta.
+existing_scores = included["IGPR PROYECTADO"].tolist()
+s = sum(existing_scores)
+n = len(existing_scores)
+if n:
+    if avg > 70:
+        needed = 0
+    else:
+        needed = int(np.floor((70*n - s)/(100-70))+1)
+        needed=max(0,needed)
+    st.info(f"Si los proyectos nuevos obtuvieran 100 puntos, se necesitarían aproximadamente {needed} proyectos adicionales para superar 70, manteniendo los proyectos incluidos actuales.")
+
+# Tabla final
+st.subheader("4. Resultado por proyecto")
+show_cols=[c for c in ["BPIN","NOMBRE","ESTADO","Nuevo estado","IGPR_ACTUAL","IGPR PROYECTADO","Tipo cálculo","No medir","Observación"] if c in edited.columns]
+st.dataframe(edited[show_cols], use_container_width=True, hide_index=True)
+
+# Exportar
+out = edited.copy()
+csv = out.to_csv(index=False).encode("utf-8-sig")
+st.download_button("Descargar proyección CSV", csv, "proyeccion_igpr.csv", "text/csv")
+
+xlsx_path = "proyeccion_igpr.xlsx"
+with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+    out.to_excel(writer,index=False,sheet_name="Proyeccion")
+    pd.DataFrame({
+        "Corte":[cutoff.date()],
+        "Proyectos incluidos":[len(included)],
+        "IGPR promedio proyectado":[avg],
+        "Meta":[70]
+    }).to_excel(writer,index=False,sheet_name="Resumen")
+
+with open(xlsx_path,"rb") as f:
+    st.download_button("Descargar proyección Excel", f, xlsx_path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+st.warning(
+    "Importante: la metodología fuente establece que el IGPR de entidad es un promedio simple de los proyectos medidos. "
+    "Por eso el modelo separa 'No medir' de 'IGPR bajo': un proyecto no medido no debe entrar al promedio. "
+    "También evita inventar el indicador de programación de 'Sin contratar' y el cumplimiento de indicadores de producto de 'Terminado' cuando la base no contiene los insumos necesarios."
+)
 
